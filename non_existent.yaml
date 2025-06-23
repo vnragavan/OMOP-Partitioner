@@ -1,0 +1,6 @@
+description: OMOP Database Partition Images
+github_token: your_github_personal_access_token
+github_username: your_github_username
+image_tag: latest
+registry_namespace: your_github_username
+repository_name: omop-partitions

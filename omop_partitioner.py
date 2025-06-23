@@ -466,10 +466,10 @@ class OMOPPartitioner:
                 conn.execute(text("SET search_path TO omopcdm, public;"))
                 conn.commit()
                 
-                for table in self.get_related_tables(self.analyze_schema()):
-                    schema, table_name = table.split('.')
+                for table_name in self.get_related_tables(self.analyze_schema()):
+                    schema, table_name = table_name.split('.')
                     result = conn.execute(text(f"SELECT COUNT(*) FROM {schema}.{table_name}"))
-                    source_counts[table] = result.scalar()
+                    source_counts[table_name] = result.scalar()
             
             # Check counts in each partition
             for i, (partition_index, engine) in enumerate(self.partition_engines):
@@ -642,22 +642,46 @@ def calculate_expected_counts(source_engine, num_partitions: int) -> Dict[str, D
     expected_counts = {}
     logger.info("\n=== Theoretical Row Count Calculations ===")
     
-    # Get all tables and their total counts
-    query = """
-        SELECT table_schema || '.' || table_name as full_table_name, 
-               (SELECT count(*) FROM information_schema.tables t2 
-                WHERE t2.table_schema = t1.table_schema 
-                AND t2.table_name = t1.table_name) as total_rows
-        FROM information_schema.tables t1
-        WHERE table_schema = 'omopcdm'
-        ORDER BY table_name;
-    """
-    
+    # Get all tables
     with source_engine.connect() as conn:
-        tables = conn.execute(text(query)).fetchall()
+        tables = conn.execute(text("""
+            SELECT table_schema || '.' || table_name as full_table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'omopcdm'
+            ORDER BY table_name;
+        """)).fetchall()
         
-        for table, total_rows in tables:
-            expected_counts[table] = {}
+        for table in tables:
+            table_name = table[0]
+            expected_counts[table_name] = {}
+            
+            # Special handling for episode_event
+            if table_name == 'omopcdm.episode_event':
+                # Get total count
+                count_query = f"SELECT COUNT(*) FROM {table_name}"
+                total_rows = conn.execute(text(count_query)).scalar()
+                
+                logger.info(f"\nTable: {table_name}")
+                logger.info(f"Total rows in source: {total_rows}")
+                logger.info("Split table based on episode.person_id")
+                
+                # Split evenly between partitions
+                base_count = total_rows // num_partitions
+                remainder = total_rows % num_partitions
+                
+                logger.info(f"Split table calculation:")
+                logger.info(f"  Base count per partition: {base_count}")
+                logger.info(f"  Remainder rows: {remainder}")
+                
+                for i in range(num_partitions):
+                    expected_count = base_count + (1 if i < remainder else 0)
+                    expected_counts[table_name][i] = expected_count
+                    logger.info(f"  Partition {i} expected: {expected_count}")
+                continue
+            
+            # Get actual row count
+            count_query = f"SELECT COUNT(*) FROM {table_name}"
+            total_rows = conn.execute(text(count_query)).scalar()
             
             # Check if table is person-dependent
             person_dep_query = f"""
@@ -665,13 +689,13 @@ def calculate_expected_counts(source_engine, num_partitions: int) -> Dict[str, D
                     SELECT 1 
                     FROM information_schema.columns 
                     WHERE table_schema = 'omopcdm' 
-                    AND table_name = '{table.split('.')[-1]}'
+                    AND table_name = '{table_name.split('.')[-1]}'
                     AND column_name = 'person_id'
                 );
             """
             has_person_id = conn.execute(text(person_dep_query)).scalar()
             
-            logger.info(f"\nTable: {table}")
+            logger.info(f"\nTable: {table_name}")
             logger.info(f"Total rows in source: {total_rows}")
             logger.info(f"Person-dependent: {has_person_id}")
             
@@ -686,52 +710,84 @@ def calculate_expected_counts(source_engine, num_partitions: int) -> Dict[str, D
                 
                 for i in range(num_partitions):
                     expected_count = base_count + (1 if i < remainder else 0)
-                    expected_counts[table][i] = expected_count
+                    expected_counts[table_name][i] = expected_count
                     logger.info(f"  Partition {i} expected: {expected_count}")
             else:
                 # Duplicated table - same count in all partitions
                 logger.info(f"Duplicated table - same count in all partitions: {total_rows}")
                 for i in range(num_partitions):
-                    expected_counts[table][i] = total_rows
+                    expected_counts[table_name][i] = total_rows
     
     logger.info("\n=== End of Theoretical Calculations ===\n")
     return expected_counts
 
+# Add this mapping at the top of your file or near the validation function
+join_partitioned_tables = {
+    'omopcdm.episode_event': {
+        'parent_table': 'omopcdm.episode',
+        'child_key': 'episode_id',
+        'parent_key': 'episode_id',
+        'person_id_col': 'person_id'
+    },
+    # Add more join-partitioned tables here as needed
+}
+
+def get_expected_partition_count(conn, table, partition_index, num_partitions, join_partitioned_tables):
+    if table in join_partitioned_tables:
+        info = join_partitioned_tables[table]
+        sql = f'''
+            SELECT COUNT(*)
+            FROM {table} c
+            JOIN {info['parent_table']} p ON c.{info['child_key']} = p.{info['parent_key']}
+            WHERE (p.{info['person_id_col']} % {num_partitions}) = {partition_index}
+        '''
+        return conn.execute(text(sql)).scalar()
+    else:
+        # Check if table has person_id
+        schema, tbl = table.split('.')
+        has_person_id = conn.execute(text(f'''
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = '{schema}'
+                AND table_name = '{tbl}'
+                AND column_name = 'person_id'
+            );
+        ''')).scalar()
+        if has_person_id:
+            sql = f'''
+                SELECT COUNT(*) FROM {table}
+                WHERE (person_id % {num_partitions}) = {partition_index}
+            '''
+            return conn.execute(text(sql)).scalar()
+        else:
+            # Duplicated table
+            sql = f'SELECT COUNT(*) FROM {table}'
+            return conn.execute(text(sql)).scalar()
+
 def validate_partitions(partition_engines: List[Tuple[int, object]], source_engine: object, num_partitions: int):
-    """Validate that partitions have correct data."""
     logger.info("Validating partitions...")
-    
-    # Calculate expected counts
-    expected_counts = calculate_expected_counts(source_engine, num_partitions)
-    
-    # Validate each partition
-    for partition_index, engine in partition_engines:
-        logger.info(f"Validating partition {partition_index}...")
-        
-        with engine.connect() as conn:
-            # Get all tables in this partition
-            tables_query = """
-                SELECT table_schema || '.' || table_name as full_table_name
-                FROM information_schema.tables
-                WHERE table_schema = 'omopcdm'
-                ORDER BY table_name;
-            """
-            tables = [row[0] for row in conn.execute(text(tables_query)).fetchall()]
-            
-            logger.info(f"Partition {partition_index} has {len(tables)} tables.")
-            
-            # Check each table's count
-            for table in tables:
-                count_query = f"SELECT COUNT(*) FROM {table}"
-                actual_count = conn.execute(text(count_query)).scalar()
-                expected_count = expected_counts[table][partition_index]
-                
-                if actual_count != expected_count:
-                    logger.error(f"Partition {partition_index} has incorrect count for {table}: "
-                               f"expected {expected_count}, got {actual_count}")
-                    raise Exception(f"Partition validation failed for {table}")
-                else:
-                    logger.info(f"  Table {table}: {actual_count} rows (expected: {expected_count})")
+    with source_engine.connect() as conn:
+        for partition_index, engine in partition_engines:
+            logger.info(f"Validating partition {partition_index}...")
+            with engine.connect() as part_conn:
+                tables_query = """
+                    SELECT table_schema || '.' || table_name as full_table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'omopcdm'
+                    ORDER BY table_name;
+                """
+                tables = [row[0] for row in part_conn.execute(text(tables_query)).fetchall()]
+                logger.info(f"Partition {partition_index} has {len(tables)} tables.")
+                for table in tables:
+                    count_query = f"SELECT COUNT(*) FROM {table}"
+                    actual_count = part_conn.execute(text(count_query)).scalar()
+                    expected_count = get_expected_partition_count(conn, table, partition_index, num_partitions, join_partitioned_tables)
+                    if actual_count != expected_count:
+                        logger.error(f"Partition {partition_index} has incorrect count for {table}: "
+                                   f"expected {expected_count}, got {actual_count}")
+                        raise Exception(f"Partition validation failed for {table}")
+                    else:
+                        logger.info(f"  Table {table}: {actual_count} rows (expected: {expected_count})")
 
 def main():
     """Main function to run the partitioner"""
@@ -760,10 +816,10 @@ def main():
         # Create partition containers
         partitioner.create_partition_containers()
         
-        # Analyze schema and create dependency graph
+        # Analyze schema and create source graph (shows table relationships from source database)
         graph = partitioner.analyze_schema()
         os.makedirs("output", exist_ok=True)
-        partitioner.export_graph(graph, "output/dependency_graph", with_png=False)
+        partitioner.export_graph(graph, "output/source_graph", with_png=True)
         
         # Distribute data
         partitioner.distribute_data(graph)

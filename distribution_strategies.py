@@ -67,6 +67,7 @@ class DistributionStrategy(ABC):
         tmp_file = tempfile.NamedTemporaryFile(delete=False)
         tmp_path = tmp_file.name
         tmp_file.close()
+        
         # COPY out from source
         src_conn = self.source_engine.raw_connection()
         try:
@@ -76,9 +77,15 @@ class DistributionStrategy(ABC):
                 src_conn.commit()
         finally:
             src_conn.close()
+            
         # Size for logging
         file_size = os.path.getsize(tmp_path)
+        
         # COPY in to destination
+        # Handle both engine object and (index, engine) tuple
+        if isinstance(dest_engine, tuple):
+            dest_engine = dest_engine[1]  # Get the engine from the tuple
+            
         dest_conn = dest_engine.raw_connection()
         try:
             cur = dest_conn.cursor()
@@ -90,6 +97,7 @@ class DistributionStrategy(ABC):
         finally:
             dest_conn.close()
             os.remove(tmp_path)
+            
         logger.info(f"Bulk-copied {file_size} bytes into partition {dest_engine.url} for table {table}")
 
     def _copy_table_data(self, table: str) -> None:
@@ -97,54 +105,60 @@ class DistributionStrategy(ABC):
         if not self.partition_engines:
             logger.error("No partition engines available for data distribution. Skipping table: %s", table)
             return
+            
         schema, table_name = table.split('.')
+        
+        # List of known lookup/reference tables that should be duplicated
+        lookup_tables = {
+            'concept', 'concept_ancestor', 'concept_class', 'concept_relationship',
+            'concept_synonym', 'domain', 'drug_strength', 'relationship',
+            'source_to_concept_map', 'vocabulary', 'cdm_source'
+        }
+        
         # Get total count of rows
         with self.source_engine.connect() as conn:
             result = conn.execute(text(f"SELECT COUNT(*) FROM {schema}.{table_name}"))
             total_rows = result.scalar()
+            
         if total_rows == 0:
             logger.info(f"No rows to distribute for table {schema}.{table_name}")
             return
-        # Determine if this table should be split by person
-        has_person = self._has_person_id_column(table)
-        # If no explicit person_id, see if graph shows a path to person (episode -> person, etc.)
-        graph_dep = False
-        try:
-            if self.dependency_graph is not None and nx.has_path(self.dependency_graph, self.person_table, table):
-                graph_dep = True
-        except Exception:
-            graph_dep = False
-        # Large lookup tables (concept*, drug_strength, etc.) – split by concept_id hash
-        hash_col = self._get_hash_column(table)
-        large_lookup = (not has_person and hash_col is not None and total_rows > 1_000_000)
-        person_dependent = has_person or graph_dep or large_lookup
-
-        # Calculate rows per partition if person-dependent
-        rows_per_partition = total_rows // len(self.partition_engines) if person_dependent else total_rows
-        remainder = total_rows % len(self.partition_engines) if person_dependent else 0
-        order_clause = "ORDER BY person_id" if has_person else ""
-        for i, (partition_index, engine) in enumerate(self.partition_engines):
-            if person_dependent and not large_lookup:
-                limit = rows_per_partition + (1 if i < remainder else 0)
-                if limit == 0:
-                    continue
-                offset = i * rows_per_partition + min(i, remainder)
-                select_query = f"SELECT * FROM {schema}.{table_name} {order_clause} LIMIT {limit} OFFSET {offset}"
+            
+        # Special handling for episode_event
+        if table_name == 'episode_event':
+            for partition_index, engine in enumerate(self.partition_engines):
+                select_query = f"""
+                    SELECT ee.* 
+                    FROM {schema}.{table_name} ee
+                    JOIN {schema}.episode e ON ee.episode_id = e.episode_id
+                    WHERE (e.person_id % {len(self.partition_engines)}) = {partition_index}
+                """
                 self._bulk_copy(table, select_query, engine)
-                logger.info(f"Distributed {limit} rows of {schema}.{table_name} to partition {partition_index}")
-            elif large_lookup:
-                # hash-based split on concept_id-like column
-                select_query = (
-                    f"SELECT * FROM {schema}.{table_name} "
-                    f"WHERE (ABS(hashtext({hash_col}::text)) % {len(self.partition_engines)}) = {partition_index}"
-                )
-                self._bulk_copy(table, select_query, engine)
-                logger.info(f"Hash-split {schema}.{table_name} to partition {partition_index}")
-            else:
-                # copy full table to every partition (lookup/static)
+                logger.info(f"Split {schema}.{table_name} to partition {partition_index} based on episode.person_id")
+            return
+            
+        # For lookup tables, copy full table to every partition
+        if table_name in lookup_tables:
+            for partition_index, engine in enumerate(self.partition_engines):
                 select_query = f"SELECT * FROM {schema}.{table_name}"
                 self._bulk_copy(table, select_query, engine)
                 logger.info(f"Copied full {schema}.{table_name} to partition {partition_index}")
+            return
+            
+        # For person-dependent tables, use modulus on person_id
+        has_person = self._has_person_id_column(table)
+        if has_person:
+            for partition_index, engine in enumerate(self.partition_engines):
+                select_query = f"SELECT * FROM {schema}.{table_name} WHERE (person_id % {len(self.partition_engines)}) = {partition_index}"
+                self._bulk_copy(table, select_query, engine)
+                logger.info(f"Distributed rows of {schema}.{table_name} to partition {partition_index} using modulus on person_id")
+            return
+            
+        # For any other tables, copy full table to every partition
+        for partition_index, engine in enumerate(self.partition_engines):
+            select_query = f"SELECT * FROM {schema}.{table_name}"
+            self._bulk_copy(table, select_query, engine)
+            logger.info(f"Copied full {schema}.{table_name} to partition {partition_index}")
 
     # ---------------- helper for large lookup tables -----------------
     def _get_hash_column(self, table: str) -> str | None:
@@ -161,47 +175,50 @@ class DistributionStrategy(ABC):
             return None
 
     def _is_person_dependent(self, table: str) -> bool:
-        """Check if a table is person-dependent (has person_id or is connected to person table)."""
+        """Check if a table is person-dependent."""
         schema, table_name = table.split('.')
-        has_person = False
-        try:
-            # Check for person_id column
-            query = f"""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_schema = '{schema}' 
-                AND table_name = '{table_name}'
-                AND column_name = 'person_id'
-            """
-            result = self.source_engine.execute(text(query)).fetchone()
-            has_person = result is not None
-        except Exception:
-            has_person = False
-
-        # Check dependency graph
-        graph_dep = False
-        try:
-            if self.dependency_graph is not None:
-                # Check if table is connected to person table through any path
-                for node in self.dependency_graph.nodes():
-                    if node == self.person_table:
-                        continue
-                    if nx.has_path(self.dependency_graph, self.person_table, node):
-                        # If current table is connected to this node, it's person-dependent
-                        if nx.has_path(self.dependency_graph, node, table):
-                            graph_dep = True
-                            break
-        except Exception:
-            graph_dep = False
-
-        return has_person or graph_dep
+        
+        # List of known lookup/reference tables that should be duplicated
+        lookup_tables = {
+            'concept', 'concept_ancestor', 'concept_class', 'concept_relationship',
+            'concept_synonym', 'domain', 'drug_strength', 'relationship',
+            'source_to_concept_map', 'vocabulary', 'cdm_source'
+        }
+        
+        if table_name in lookup_tables:
+            return False
+            
+        # Check if table has person_id column
+        with self.source_engine.connect() as conn:
+            has_person_id = conn.execute(text(f"""
+                SELECT EXISTS (
+                    SELECT 1 
+                    FROM information_schema.columns 
+                    WHERE table_schema = '{schema}'
+                    AND table_name = '{table_name}'
+                    AND column_name = 'person_id'
+                );
+            """)).scalar()
+            
+            if has_person_id:
+                return True
+                
+            # Check for indirect person dependency through episode
+            if table_name == 'episode_event':
+                return True
+                
+            return False
 
     def distribute_table(self, table: str, total_rows: int):
         """Distribute a table's data across partitions."""
         schema, table_name = table.split('.')
         
-        # Check if table is person-dependent
-        person_dependent = self._is_person_dependent(table)
+        # List of known lookup/reference tables that should be duplicated
+        lookup_tables = {
+            'concept', 'concept_ancestor', 'concept_class', 'concept_relationship',
+            'concept_synonym', 'domain', 'drug_strength', 'relationship',
+            'source_to_concept_map', 'vocabulary', 'cdm_source'
+        }
         
         # Special handling for episode_event - split based on episode's person_id
         if table == 'omopcdm.episode_event':
@@ -216,22 +233,32 @@ class DistributionStrategy(ABC):
                 logger.info(f"Split {schema}.{table_name} to partition {partition_index} based on episode.person_id")
             return
 
-        # For other tables, proceed with normal distribution
-        rows_per_partition = total_rows // len(self.partition_engines)
-        remainder = total_rows % len(self.partition_engines)
+        # For lookup tables, copy full table to every partition
+        if table_name in lookup_tables:
+            for partition_index, engine in enumerate(self.partition_engines):
+                select_query = f"SELECT * FROM {schema}.{table_name}"
+                self._bulk_copy(table, select_query, engine)
+                logger.info(f"Copied full {schema}.{table_name} to partition {partition_index}")
+            return
 
-        for partition_index, engine in enumerate(self.partition_engines):
-            if person_dependent:
+        # For person-dependent tables, split based on person_id
+        if self._is_person_dependent(table):
+            rows_per_partition = total_rows // len(self.partition_engines)
+            remainder = total_rows % len(self.partition_engines)
+            
+            for partition_index, engine in enumerate(self.partition_engines):
                 limit = rows_per_partition + (1 if partition_index < remainder else 0)
                 offset = partition_index * rows_per_partition + min(partition_index, remainder)
                 select_query = f"SELECT * FROM {schema}.{table_name} ORDER BY person_id LIMIT {limit} OFFSET {offset}"
                 self._bulk_copy(table, select_query, engine)
                 logger.info(f"Distributed {total_rows} rows of {schema}.{table_name} to partition {partition_index}")
-            else:
-                # copy full table to every partition (lookup/static)
-                select_query = f"SELECT * FROM {schema}.{table_name}"
-                self._bulk_copy(table, select_query, engine)
-                logger.info(f"Copied full {schema}.{table_name} to partition {partition_index}")
+            return
+
+        # For any other tables, copy full table to every partition
+        for partition_index, engine in enumerate(self.partition_engines):
+            select_query = f"SELECT * FROM {schema}.{table_name}"
+            self._bulk_copy(table, select_query, engine)
+            logger.info(f"Copied full {schema}.{table_name} to partition {partition_index}")
 
 class UniformDistributionStrategy(DistributionStrategy):
     """Distributes data uniformly across partitions based on person_id ranges"""
